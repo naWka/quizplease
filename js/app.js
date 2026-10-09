@@ -672,8 +672,8 @@
           ${qHead(r, q, tag)}
           ${text ? `<h2 class="q-text ${text.length > 140 ? 'is-long' : ''}">${fmtText(text)}</h2>` : ''}
           ${visualHtml(question)}
-          ${question.options ? optionsHtml(question, false) : ''}
           ${media ? '<div class="q-media" data-media></div>' : ''}
+          ${question.options ? optionsHtml(question, false) : ''}
           ${useTimer ? `<button class="timer" data-timer data-act="timer"><span class="timer-track"><i></i></span><span class="timer-num">${time}</span></button>` : ''}
         </div>`,
       next: last ? 'К ответам →' : 'Следующий вопрос →',
