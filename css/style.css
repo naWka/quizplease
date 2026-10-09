@@ -358,6 +358,9 @@ code {
   font-family: var(--font-display);
   color: var(--accent);
 }
+/* под клипом места мало: короткие варианты встают в один ряд и мельче */
+.q--media .q-options { grid-template-columns: repeat(auto-fit, minmax(min(100%, 13em), 1fr)); gap: 0.6em; }
+.q--media .q-options li { padding: 0.55em 0.9em; font-size: clamp(15px, 1vw + 0.4vh, 24px); }
 .q-options li.is-correct { border-color: var(--good); background: rgba(46, 230, 182, 0.14); }
 .q-options li.is-correct b { background: var(--good); color: #002a20; }
 .q-options li.is-wrong { opacity: 0.4; }
@@ -416,6 +419,8 @@ code {
   margin-inline: auto;
 }
 .clip--audio .clip-screen { aspect-ratio: 16 / 5; max-height: 30vh; }
+/* видео держит 16:9 и при ограничении по высоте — без чёрных полос по бокам */
+.clip--video .clip-screen, .clip--reveal .clip-screen { width: min(100%, 56vh * 16 / 9); }
 .clip-frame, .clip-frame iframe, .clip-frame video, .clip-frame > div {
   position: absolute;
   inset: 0;
@@ -450,9 +455,10 @@ code {
   background:
     radial-gradient(600px 300px at 50% 120%, rgba(155, 123, 255, 0.35), transparent 70%),
     #120f22;
-  transition: opacity 0.25s ease;
 }
-.clip--video[data-state="playing"] .clip-curtain { opacity: 0; transition-delay: 0.45s; }
+/* открывается плавно и с задержкой (прячет заголовок в первые доли секунды),
+   а закрывается мгновенно — иначе на паузе успевает мелькнуть оверлей YouTube с названием */
+.clip--video[data-state="playing"] .clip-curtain { opacity: 0; transition: opacity 0.25s ease 0.45s; }
 .clip--reveal:is([data-state="playing"], [data-state="paused"], [data-state="ended"]) .clip-curtain { opacity: 0; }
 
 .clip-msg { color: var(--muted); font-weight: 700; display: grid; gap: 0.4em; justify-items: center; text-align: center; }
@@ -523,7 +529,12 @@ code {
   text-wrap: pretty;
 }
 .a-note::before { content: '💡 '; }
-.a-media .clip-screen { max-height: 42vh; }
+.a-media .clip-screen { max-height: 42vh; width: min(100%, 42vh * 16 / 9); }
+.a.is-revealed { gap: clamp(10px, 1.5vh, 22px); }
+.a.is-revealed .a-question, .a.is-revealed .a-visual { display: none; }
+.a.is-revealed .a-answer { font-size: clamp(26px, 2.6vw + 0.6vh, 60px); }
+.a.is-revealed .q-options { grid-template-columns: repeat(auto-fit, minmax(min(100%, 13em), 1fr)); gap: 0.5em; }
+.a.is-revealed .q-options li { padding: 0.4em 0.8em; }
 
 .marks { display: flex; flex-wrap: wrap; gap: 0.8em; justify-content: center; margin-top: 0.4em; }
 .mark {
@@ -540,6 +551,11 @@ code {
 .mark-name > span { display: grid; line-height: 1.2; }
 .mark-name small, .bet-name small, .board-name small { color: var(--muted); font-weight: 600; font-size: 0.72em; }
 .mark-name em { color: var(--muted); font-style: normal; font-weight: 700; font-size: 0.85em; }
+/* четыре команды — плашки поуже, чтобы встали в один ряд и не толкали «Дальше» за край */
+.marks:has(.mark:nth-child(4)) { gap: 0.5em; }
+.marks:has(.mark:nth-child(4)) .mark { gap: 0.45em; padding-left: 0.75em; }
+.marks:has(.mark:nth-child(4)) .seg-btn { min-width: 2.2em; padding: 0.4em 0.6em; }
+.marks:has(.mark:nth-child(4)) .mark-delta { min-width: 1.6em; }
 .mark-delta { min-width: 2.2em; font-weight: 800; font-size: 1.15em; font-variant-numeric: tabular-nums; color: var(--muted); text-align: center; }
 .seg { display: flex; gap: 0.3em; padding: 0.2em; border-radius: 999px; background: rgba(0, 0, 0, 0.25); }
 .seg-btn {
@@ -608,8 +624,10 @@ code {
 
 /* ---------- final ---------- */
 
+/* на узком экране таблица прокручивается вбок, а не обрезается с обеих сторон */
+.final { grid-template-columns: minmax(0, 1fr); }
+.final-wrap { max-width: 100%; overflow-x: auto; margin-top: 1em; border-radius: 18px; }
 .final-table {
-  margin-top: 1em;
   border-collapse: separate;
   border-spacing: 0;
   min-width: min(100%, 560px);
@@ -857,13 +875,19 @@ code {
 /* ---------- responsive ---------- */
 
 @media (max-width: 900px) {
-  .setup { grid-template-columns: 1fr; }
+  .setup { grid-template-columns: minmax(0, 1fr); }
   .hints { display: none; }
   .crumb { display: none; }
   .q-options { grid-template-columns: 1fr; }
   .board-row { grid-template-columns: 1.6em 1fr auto; }
   .board-bar, .board-round { display: none; }
   .chip-name { max-width: 5em; }
+}
+
+/* телефон: переключатель числа команд не должен распирать страницу шире экрана */
+@media (max-width: 480px) {
+  .seg--mode .seg-btn { min-width: 2.2em; padding: 0.55em 0.6em; }
+  .top { gap: 0.5em; }
 }
 
 @media (prefers-reduced-motion: reduce) {

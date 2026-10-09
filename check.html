@@ -22,36 +22,60 @@
   <h1>Проверка клипов</h1>
   <p>Без спойлеров: только пак, раунд и номер вопроса. Звук выключен. Займёт около минуты.</p>
   <div id="env"></div>
-  <div id="summary">Загружаю YouTube…</div>
+  <div id="summary">Загружаю…</div>
   <ol id="list"></ol>
 </main>
 <div id="player"></div>
-<script src="packs/proba.js"></script>
-<script src="packs/vecher-1.js"></script>
-<script src="packs/stranger-things.js"></script>
 <script>
   const REASONS = { 2: 'неверный ID', 5: 'ошибка плеера', 100: 'видео удалено', 101: 'встраивание запрещено', 150: 'встраивание запрещено (или недоступно в вашем регионе)', 153: 'страница открыта не через сервер' };
   const env = document.getElementById('env');
-  if (location.protocol === 'file:') env.innerHTML = '<p class="bad">Страница открыта как файл — так YouTube не работает. Запустите start.command.</p>';
-  const clips = [];
-  (window.QUIZ_PACKS || []).forEach(p => p.rounds.forEach((r, ri) => r.questions.forEach((q, qi) => {
-    if (q.yt) clips.push({ label: `«${p.title}» — раунд ${ri + 1}, вопрос ${qi + 1}`, ...q.yt });
-  })));
   const list = document.getElementById('list');
-  const rows = clips.map(c => { const li = document.createElement('li'); li.innerHTML = `${c.label}: <span class="wait">ждёт</span>`; list.appendChild(li); return li.lastChild; });
   const summary = document.getElementById('summary');
+  const clips = [];
+  let rows = [];
 
-  function check(c) {
+  // паки берём из index.html — чтобы новый пак не надо было прописывать ещё и здесь
+  async function loadPacks() {
+    const html = await fetch('index.html', { cache: 'no-store' }).then(r => r.text());
+    const srcs = [...html.matchAll(/<script\s+src="(packs\/[^"]+\.js)"/g)].map(m => m[1]);
+    for (const src of srcs) {
+      await new Promise(res => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = res;
+        s.onerror = () => { env.innerHTML += `<p class="bad">Не загрузился ${src}</p>`; res(); };
+        document.head.appendChild(s);
+      });
+    }
+  }
+
+  function buildList() {
+    (window.QUIZ_PACKS || []).forEach(p => p.rounds.forEach((r, ri) => r.questions.forEach((q, qi) => {
+      const label = `«${p.title}» — раунд ${ri + 1}, вопрос ${qi + 1}`;
+      if (q.yt) clips.push({ label, kind: 'yt', ...q.yt });
+      else if (q.file) clips.push({ label, kind: 'file', ...q.file });
+    })));
+    rows = clips.map(c => { const li = document.createElement('li'); li.innerHTML = `${c.label}: <span class="wait">ждёт</span>`; list.appendChild(li); return li.lastChild; });
+  }
+
+  function checkYT(c) {
     return new Promise(res => {
       document.getElementById('player').innerHTML = '<div id="pp"></div>';
       let done = false, player;
       const finish = (ok, text) => { if (done) return; done = true; try { player.destroy(); } catch (e) {} res({ ok, text }); };
       player = new YT.Player('pp', {
         videoId: c.id, width: 160, height: 90,
-        playerVars: { start: c.start, controls: 0, mute: 1, playsinline: 1, origin: location.origin },
+        playerVars: { start: Math.floor(c.start || 0), controls: 0, mute: 1, playsinline: 1, origin: location.origin },
         events: {
           onReady: e => { e.target.mute(); e.target.playVideo(); },
-          onStateChange: e => { if (e.data === 1) setTimeout(() => finish(true, 'играет'), 800); },
+          onStateChange: e => {
+            if (e.data !== 1) return;
+            setTimeout(() => {
+              const dur = player.getDuration ? player.getDuration() : 0;
+              if (dur && c.end > dur + 0.5) finish(false, `фрагмент кончается на ${c.end} с, а видео длится ${Math.floor(dur)} с`);
+              else finish(true, 'играет');
+            }, 800);
+          },
           onError: e => finish(false, `ошибка ${e.data}: ${REASONS[e.data] || 'неизвестно'}`),
         },
       });
@@ -59,20 +83,48 @@
     });
   }
 
-  window.onYouTubeIframeAPIReady = async () => {
+  function checkFile(c) {
+    return new Promise(res => {
+      const m = document.createElement('video');
+      const finish = (ok, text) => { m.removeAttribute('src'); m.load(); res({ ok, text }); };
+      m.preload = 'metadata';
+      m.onloadedmetadata = () => (c.end && c.end > m.duration + 0.5
+        ? finish(false, `фрагмент кончается на ${c.end} с, а файл длится ${Math.floor(m.duration)} с`)
+        : finish(true, 'файл на месте'));
+      m.onerror = () => finish(false, 'файл не найден или формат не поддерживается');
+      m.src = c.src;
+    });
+  }
+
+  async function run() {
     let bad = 0;
     for (let i = 0; i < clips.length; i++) {
       summary.textContent = `Проверяю ${i + 1} из ${clips.length}…`;
       rows[i].className = 'wait'; rows[i].textContent = 'проверяю…';
-      const r = await check(clips[i]);
+      const r = await (clips[i].kind === 'yt' ? checkYT(clips[i]) : checkFile(clips[i]));
       rows[i].className = r.ok ? 'ok' : 'bad';
       rows[i].textContent = r.text;
       if (!r.ok) bad++;
     }
     summary.innerHTML = bad ? `<span class="bad">Не играют: ${bad} из ${clips.length}</span>` : `<span class="ok">Все ${clips.length} клипов играют</span>`;
-  };
-  setTimeout(() => { if (!window.YT || !YT.Player) summary.innerHTML = '<span class="bad">YouTube не загрузился: нет интернета, нужен VPN или его блокирует расширение/настройки приватности браузера.</span>'; }, 15000);
+  }
+
+  (async () => {
+    if (location.protocol === 'file:') {
+      env.innerHTML = '<p class="bad">Страница открыта как файл — так YouTube не работает. Запустите start.command.</p>';
+      summary.textContent = '';
+      return;
+    }
+    await loadPacks();
+    buildList();
+    if (!clips.length) { summary.textContent = 'В паках нет фрагментов.'; return; }
+    if (!clips.some(c => c.kind === 'yt')) return run();
+    window.onYouTubeIframeAPIReady = run;
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+    setTimeout(() => { if (!window.YT || !YT.Player) summary.innerHTML = '<span class="bad">YouTube не загрузился: нет интернета, нужен VPN или его блокирует расширение/настройки приватности браузера.</span>'; }, 15000);
+  })().catch(err => { summary.innerHTML = `<span class="bad">Не получилось загрузить паки: ${err.message}</span>`; });
 </script>
-<script src="https://www.youtube.com/iframe_api"></script>
 </body>
 </html>

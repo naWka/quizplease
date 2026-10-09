@@ -21,7 +21,8 @@
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmtText = s => esc(s).replace(/\n/g, '<br>');
   const fmtTime = s => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
-  const fmtPts = n => { const v = Math.round(n * 10) / 10; return String(v).replace('.', ','); };
+  const fmtPts = n => { const v = Math.round(n * 10) / 10; return String(v).replace('.', ',').replace('-', '−'); };
+  const joinAnd = items => (items.length > 1 ? `${items.slice(0, -1).join(', ')} и ${items[items.length - 1]}` : items.join(''));
   const signed = n => (n > 0 ? '+' : n < 0 ? '−' : '') + fmtPts(Math.abs(n));
   const plural = (n, one, few, many) => {
     if (!Number.isInteger(n)) return few;
@@ -100,6 +101,7 @@
       this.handle = null;
       this.render();
     },
+    // сбрасывает и время: иначе T/пробел на экране без таймера запускали бы невидимый таймер со звуками
     stop() {
       this.running = false;
       clearInterval(this.handle);
@@ -107,10 +109,13 @@
       this.handle = null;
       this.doneHandle = null;
       this.onDone = null;
+      this.total = 0;
+      this.left = 0;
+      this.done = false;
     },
+    // время вышло — ждём автоперехода, второй круг таймера не запускаем
     toggle() {
-      if (!this.total) return;
-      if (this.left <= 0) { this.left = this.total; this.done = false; this.start(); return; }
+      if (!this.total || this.done) return;
       this.running ? this.pause() : this.start();
     },
     step() {
@@ -264,6 +269,7 @@
       if (this.onEnded) this.onEnded();
     }
     fail(code) {
+      if (this.destroyed) return;
       cancelAnimationFrame(this.raf);
       this.setState('error');
       const link = this.media.kind === 'yt'
@@ -392,6 +398,24 @@
     return null;
   }
 
+  // Клип ужимается под высоту окна, чтобы варианты, таймер и «Дальше» были видны без прокрутки.
+  // Видео не меньше 480×270: в маленьком плеере YouTube показывает свои плашки, а они спойлерят.
+  function fitClip() {
+    const scr = app.querySelector('.clip-screen');
+    if (!scr) return;
+    scr.style.maxHeight = '';
+    scr.style.maxWidth = '';
+    const over = document.documentElement.scrollHeight - window.innerHeight;
+    if (over <= 0) return;
+    const audio = !!scr.closest('.clip--audio');
+    // на сверке ответ уже открыт — там клип может быть меньше
+    const min = audio ? 110 : scr.closest('.clip--reveal') ? 200 : 270;
+    const h = Math.max(min, Math.floor(scr.getBoundingClientRect().height - over));
+    scr.style.maxHeight = `${h}px`;
+    if (!audio) scr.style.maxWidth = `${Math.round(h * 16 / 9)}px`;
+  }
+  window.addEventListener('resize', fitClip);
+
   // ---------- game state ----------
 
   const prefs = Object.assign(
@@ -399,12 +423,19 @@
     store.get(PREFS_KEY) || {},
   );
   // старый формат: список игроков → каждый игрок = команда из одного человека
-  if (prefs.players) {
-    prefs.teams = prefs.players.slice(0, MAX_TEAMS)
+  if (Array.isArray(prefs.players)) {
+    prefs.teams = prefs.players.map(n => String(n ?? ''))
       .map(n => ({ name: '', members: /^Игрок \d+$/.test(n) || !n.trim() ? [] : [n.trim()] }));
-    delete prefs.players;
   }
-  if (!Array.isArray(prefs.teams) || !prefs.teams.length) prefs.teams = [{ name: '', members: [] }];
+  delete prefs.players;
+  // битые или слишком старые настройки не должны ронять экран выбора
+  prefs.teams = (Array.isArray(prefs.teams) ? prefs.teams : []).slice(0, MAX_TEAMS).map(t => ({
+    name: t && typeof t.name === 'string' ? t.name : '',
+    members: t && Array.isArray(t.members) ? t.members.filter(m => typeof m === 'string' && m.trim()) : [],
+  }));
+  if (!prefs.teams.length) prefs.teams = [{ name: '', members: [] }];
+  prefs.timer = prefs.timer !== false;
+  prefs.sound = prefs.sound !== false;
   Sound.enabled = prefs.sound;
   if (!PACKS.some(p => p.id === prefs.packId) && PACKS[0]) prefs.packId = PACKS[0].id;
 
@@ -501,13 +532,38 @@
   const FLOW = 2;
   const packSig = p => `${FLOW}:` + p.rounds.map(r => `${r.type || ''}${r.questions.length}`).join(',');
   function savedPack(saved) {
-    const p = saved && PACKS.find(x => x.id === saved.packId);
+    if (!saved || !Array.isArray(saved.teams) || !saved.teams.length || !Number.isInteger(saved.step)) return null;
+    if (saved.teams.length > MAX_TEAMS || !saved.teams.every(t => t && typeof t.name === 'string')) return null;
+    if (!saved.marks || typeof saved.marks !== 'object' || !saved.bets || typeof saved.bets !== 'object') return null;
+    const p = PACKS.find(x => x.id === saved.packId);
     return p && saved.sig === packSig(p) ? p : null;
   }
 
   // ---------- views ----------
 
   function render() {
+    try {
+      renderScreen();
+    } catch (err) {
+      // ошибка в паке или в сохранении не должна оставлять пустой экран посреди вечера
+      console.error(err);
+      Media.destroy();
+      Timer.stop();
+      app.innerHTML = `
+        <div class="modal">
+          <div class="modal-card">
+            <div class="kicker">Ой</div>
+            <h2 class="modal-title">Что-то сломалось</h2>
+            <p class="modal-note">${esc(err && err.message)}</p>
+            ${game
+              ? '<button class="btn btn--primary btn--big" data-act="crash-menu">В главное меню</button>'
+              : '<button class="btn btn--primary btn--big" data-act="crash-reset">Сбросить сохранения и начать заново</button>'}
+          </div>
+        </div>`;
+    }
+  }
+
+  function renderScreen() {
     Media.destroy();
     Timer.stop();
     if (confettiEl) { confettiEl.remove(); confettiEl = null; }
@@ -564,6 +620,7 @@
         <div class="dots ${review ? 'dots--review' : ''}" title="${review ? 'Сверка ответов' : 'Вопросы раунда'}">${dots}</div>
         <div class="hints">${v.hints || ''}</div>
         <div class="nav">
+          ${canGoBack() ? '<button class="btn btn--ghost" data-act="back" title="Предыдущий ответ (←)">← Назад</button>' : ''}
           <button class="btn btn--primary" data-act="next" ${v.nextDisabled ? 'disabled' : ''}>${v.next}</button>
         </div>
       </footer>`;
@@ -666,6 +723,9 @@
     }
     const text = question.q || round.prompt || '';
     const last = q === round.questions.length - 1;
+    const hints = media ? ['Пробел — играть/пауза', 'R — заново'] : [];
+    if (useTimer) hints.push(media ? 'T — таймер' : 'Пробел или T — пауза таймера');
+    if (!hints.length) hints.push('Enter или → — дальше');
     return {
       html: `
         <div class="q ${media ? 'q--media' : ''}">
@@ -677,7 +737,7 @@
           ${useTimer ? `<button class="timer" data-timer data-act="timer"><span class="timer-track"><i></i></span><span class="timer-num">${time}</span></button>` : ''}
         </div>`,
       next: last ? 'К ответам →' : 'Следующий вопрос →',
-      hints: media ? 'Пробел — играть/пауза · R — заново · T — таймер' : 'T — пауза таймера',
+      hints: hints.join(' · '),
       mount: () => {
         if (useTimer) Timer.setup(time, next);
         if (media) {
@@ -687,6 +747,8 @@
             onPlay: () => { if (Timer.running) Timer.pause(); },
             onEnded: () => { if (useTimer) Timer.start(); },
           });
+          fitClip();
+          if (document.fonts) document.fonts.ready.then(fitClip);
         } else if (useTimer) {
           Timer.start();
         }
@@ -746,7 +808,7 @@
         <div class="a">
           ${qHead(r, q, `${question.topic && round.type !== 'bets' ? `<span class="tag">${esc(question.topic)}</span>` : ''}<span class="tag tag--good">Сверка</span>`)}
           ${question.q || round.prompt ? `<p class="a-question">${fmtText(question.q || round.prompt)}</p>` : ''}
-          ${question.emoji || question.list ? `<div class="a-visual">${visualHtml(question)}</div>` : ''}
+          ${question.emoji || question.list || question.image ? `<div class="a-visual">${visualHtml(question)}</div>` : ''}
           ${question.options ? optionsHtml(question, true) : ''}
           <div class="a-answer">${fmtText(question.a)}</div>
           ${question.note ? `<p class="a-note">${fmtText(question.note)}</p>` : ''}
@@ -808,7 +870,7 @@
             : 'главное — весело провели вечер.');
     } else if (winners.length > 1) {
       title = 'Ничья!';
-      sub = `${winners.map(x => esc(x.name)).join(' и ')} — по ${fmtPts(best)} из ${max}. Требуется реванш.`;
+      sub = `${joinAnd(winners.map(x => esc(x.name)))} — по ${fmtPts(best)} из ${max}. Требуется реванш.`;
     } else {
       const w = winners[0];
       title = w.members.length > 1 ? `Побеждает команда «${esc(w.name)}»!` : `Побеждает ${esc(w.name)}!`;
@@ -824,7 +886,7 @@
           <div class="kicker">Игра окончена</div>
           <h1 class="final-title">${title}</h1>
           ${sub ? `<p class="intro-desc">${sub}</p>` : ''}
-          <table class="final-table"><thead><tr><th></th>${head}</tr></thead><tbody>${body}</tbody><tfoot>${foot}</tfoot></table>
+          <div class="final-wrap"><table class="final-table"><thead><tr><th></th>${head}</tr></thead><tbody>${body}</tbody><tfoot>${foot}</tfoot></table></div>
         </div>`,
       next: 'Новая игра',
       mount: () => { Sound.fanfare(); confetti(); },
@@ -993,23 +1055,34 @@
       startedAt: Date.now(),
     };
     Sound.ensure();
-    render();
+    goTo(0);
   }
 
   function resumeGame() {
     const saved = migrateSave(store.get(SAVE_KEY));
     pack = savedPack(saved);
-    if (!pack) return;
+    if (!pack) return render();
     steps = buildSteps(pack);
     game = saved;
-    game.step = Math.min(game.step, steps.length - 1);
     Sound.ensure();
-    render();
+    goTo(Math.max(0, Math.min(game.step, steps.length - 1)));
   }
 
   // ---------- actions ----------
 
+  // двойной клик или нажатие ровно в момент автоперехода не должны проскакивать вопрос
+  const NAV_COOLDOWN = 350;
+  let stepChangedAt = 0;
+
+  function goTo(step) {
+    game.step = step;
+    stepChangedAt = performance.now();
+    render();
+    window.scrollTo(0, 0);
+  }
+
   function next() {
+    if (!game || performance.now() - stepChangedAt < NAV_COOLDOWN) return;
     const st = steps[game.step];
     if (st.kind === 'bet' && !allBetsSet(key(st.r, st.q))) return;
     if (st.kind === 'final') {
@@ -1018,17 +1091,19 @@
       render();
       return;
     }
-    game.step = Math.min(steps.length - 1, game.step + 1);
-    render();
+    goTo(Math.min(steps.length - 1, game.step + 1));
   }
 
   // назад можно только внутри сверки — поправить отметку
-  function back() {
+  function canGoBack() {
     const st = steps[game.step];
     const prev = steps[game.step - 1];
-    if (!prev || prev.kind !== 'answer' || !['answer', 'roundEnd'].includes(st.kind)) return;
-    game.step -= 1;
-    render();
+    return !!prev && prev.kind === 'answer' && (st.kind === 'answer' || st.kind === 'roundEnd');
+  }
+
+  function back() {
+    if (!game || !canGoBack() || performance.now() - stepChangedAt < NAV_COOLDOWN) return;
+    goTo(game.step - 1);
   }
 
   let menu = null;
@@ -1040,7 +1115,14 @@
     clearTimeout(Timer.doneHandle);
     Timer.doneHandle = null;
     Timer.pause();
-    if (Media.ctrl && Media.ctrl.state === 'playing') Media.ctrl.pause();
+    const clip = Media.ctrl;
+    if (clip) {
+      // фрагмент, который ещё грузится после «Слушать», не должен заиграть за меню
+      if (clip.pendingPlay) { clip.pendingPlay = false; clip.renderUI(); }
+      if (clip.state === 'playing') clip.pause();
+    }
+    // всё под меню недоступно: Tab + Enter не нажмёт кнопки игры за затемнением
+    app.inert = true;
     menu.el.className = 'modal';
     menu.el.innerHTML = `
       <div class="modal-card" role="dialog" aria-modal="true" aria-label="Пауза">
@@ -1069,6 +1151,7 @@
     const { el, wasRunning, pendingNext } = menu;
     menu = null;
     el.remove();
+    app.inert = false;
     if (!resume) return;
     if (pendingNext) next();
     else if (wasRunning) Timer.start();
@@ -1119,6 +1202,9 @@
     const host = app.querySelector('[data-media]');
     const ctrl = Media.mount(host, mediaOf(questionOf(st.r, st.q)), { mode: 'reveal' });
     host.classList.add('is-open');
+    // освобождаем место под клип, чтобы отметки команд остались на экране
+    host.closest('.a').classList.add('is-revealed');
+    fitClip();
     ctrl.play();
   }
 
@@ -1179,6 +1265,16 @@
       store.set(PREFS_KEY, prefs);
       render();
     },
+    // аварийный экран: сохранение не трогаем — вдруг ошибку поправят и игру можно будет продолжить
+    'crash-menu': () => {
+      game = null;
+      render();
+    },
+    'crash-reset': () => {
+      store.del(SAVE_KEY);
+      store.del(PREFS_KEY);
+      location.reload();
+    },
   };
 
   app.addEventListener('click', e => {
@@ -1215,6 +1311,14 @@
         renderSetupKeepFocus(`[data-member-input="${memberInput}"]`);
         return;
       }
+      // Enter после названия команды — к вводу участников, а не старт игры
+      const teamName = e.target.dataset && e.target.dataset.teamName;
+      if (teamName != null) {
+        const input = app.querySelector(`[data-member-input="${teamName}"]`);
+        if (input) input.focus();
+        return;
+      }
+      if (e.repeat) return;
       startGame();
       return;
     }
@@ -1224,6 +1328,8 @@
     }
     if (typing) return;
     if ((e.key === 'Enter' || e.key === ' ') && e.target.closest('button')) return;
+    // зажатая клавиша не должна пролистывать вопросы пачкой
+    if (e.repeat) { if (['ArrowRight', 'ArrowLeft', 'Enter', 'NumpadEnter', 'PageDown', 'PageUp', 'Space'].includes(e.code)) e.preventDefault(); return; }
 
     switch (e.code) {
       case 'ArrowRight': case 'Enter': case 'NumpadEnter': case 'PageDown':
@@ -1240,6 +1346,7 @@
       case 'KeyM': toggleSound(); break;
       case 'Escape': openMenu(); break;
       case 'Digit1': case 'Digit2': case 'Digit3': case 'Digit4':
+      case 'Numpad1': case 'Numpad2': case 'Numpad3': case 'Numpad4':
         cycleMark(+e.code.slice(-1) - 1); break;
       default:
     }
