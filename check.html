@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Проверка клипов</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 24px 16px; background: #0e0c18; color: #f5f2ff; font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  p { color: #a8a1cb; margin: 0 0 16px; }
+  #player { position: fixed; right: 16px; bottom: 16px; width: 160px; height: 90px; opacity: 0.25; pointer-events: none; }
+  ol { padding-left: 1.4em; }
+  li { padding: 2px 0; font-variant-numeric: tabular-nums; }
+  .ok { color: #2ee6b6; } .bad { color: #ff5d73; font-weight: 700; } .wait { color: #a8a1cb; }
+  #summary { font-weight: 700; margin: 16px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Проверка клипов</h1>
+  <p>Без спойлеров: только пак, раунд и номер вопроса. Звук выключен. Займёт около минуты.</p>
+  <div id="env"></div>
+  <div id="summary">Загружаю YouTube…</div>
+  <ol id="list"></ol>
+</main>
+<div id="player"></div>
+<script src="packs/proba.js"></script>
+<script src="packs/vecher-1.js"></script>
+<script src="packs/stranger-things.js"></script>
+<script>
+  const REASONS = { 2: 'неверный ID', 5: 'ошибка плеера', 100: 'видео удалено', 101: 'встраивание запрещено', 150: 'встраивание запрещено (или недоступно в вашем регионе)', 153: 'страница открыта не через сервер' };
+  const env = document.getElementById('env');
+  if (location.protocol === 'file:') env.innerHTML = '<p class="bad">Страница открыта как файл — так YouTube не работает. Запустите start.command.</p>';
+  const clips = [];
+  (window.QUIZ_PACKS || []).forEach(p => p.rounds.forEach((r, ri) => r.questions.forEach((q, qi) => {
+    if (q.yt) clips.push({ label: `«${p.title}» — раунд ${ri + 1}, вопрос ${qi + 1}`, ...q.yt });
+  })));
+  const list = document.getElementById('list');
+  const rows = clips.map(c => { const li = document.createElement('li'); li.innerHTML = `${c.label}: <span class="wait">ждёт</span>`; list.appendChild(li); return li.lastChild; });
+  const summary = document.getElementById('summary');
+
+  function check(c) {
+    return new Promise(res => {
+      document.getElementById('player').innerHTML = '<div id="pp"></div>';
+      let done = false, player;
+      const finish = (ok, text) => { if (done) return; done = true; try { player.destroy(); } catch (e) {} res({ ok, text }); };
+      player = new YT.Player('pp', {
+        videoId: c.id, width: 160, height: 90,
+        playerVars: { start: c.start, controls: 0, mute: 1, playsinline: 1, origin: location.origin },
+        events: {
+          onReady: e => { e.target.mute(); e.target.playVideo(); },
+          onStateChange: e => { if (e.data === 1) setTimeout(() => finish(true, 'играет'), 800); },
+          onError: e => finish(false, `ошибка ${e.data}: ${REASONS[e.data] || 'неизвестно'}`),
+        },
+      });
+      setTimeout(() => finish(false, 'не стартовал за 15 сек (медленный интернет/VPN или браузер блокирует автозапуск)'), 15000);
+    });
+  }
+
+  window.onYouTubeIframeAPIReady = async () => {
+    let bad = 0;
+    for (let i = 0; i < clips.length; i++) {
+      summary.textContent = `Проверяю ${i + 1} из ${clips.length}…`;
+      rows[i].className = 'wait'; rows[i].textContent = 'проверяю…';
+      const r = await check(clips[i]);
+      rows[i].className = r.ok ? 'ok' : 'bad';
+      rows[i].textContent = r.text;
+      if (!r.ok) bad++;
+    }
+    summary.innerHTML = bad ? `<span class="bad">Не играют: ${bad} из ${clips.length}</span>` : `<span class="ok">Все ${clips.length} клипов играют</span>`;
+  };
+  setTimeout(() => { if (!window.YT || !YT.Player) summary.innerHTML = '<span class="bad">YouTube не загрузился: нет интернета, нужен VPN или его блокирует расширение/настройки приватности браузера.</span>'; }, 15000);
+</script>
+<script src="https://www.youtube.com/iframe_api"></script>
+</body>
+</html>
