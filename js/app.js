@@ -325,35 +325,114 @@
     }
   }
 
-  class YTClip extends Clip {
-    init() {
-      const id = 'yt-' + Math.random().toString(36).slice(2);
-      this.frame.innerHTML = `<div id="${id}"></div>`;
+  // YouTube-плеер отдельно от экрана вопроса: его можно создать заранее (см. Preload) и потом отдать клипу.
+  // Пока хозяина нет, события плеера обрабатывает сам слот; потом — клип.
+  class YTSlot {
+    constructor(media, parent) {
+      this.media = media;
+      this.key = mediaKey(media);
+      this.owner = null;
+      this.ready = false;
+      this.error = null;
+      this.settled = false; // прогрев закончен (или не удался) — можно греть следующий
+      this.destroyed = false;
+      this.el = document.createElement('div');
+      const target = document.createElement('div');
+      this.el.appendChild(target);
+      parent.appendChild(this.el);
+      // YouTube не ответил (нет сети) — не держим очередь прогрева
+      this.settleTimer = setTimeout(() => this.settle(), 20000);
       loadYouTubeApi().then(YT => {
         if (this.destroyed) return;
-        this.player = new YT.Player(id, {
-          videoId: this.media.id,
+        this.player = new YT.Player(target, {
+          videoId: media.id,
           width: '100%',
           height: '100%',
           playerVars: {
-            start: Math.floor(this.start),
+            start: Math.floor(media.start || 0),
             controls: 0, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3,
             playsinline: 1, modestbranding: 1, cc_load_policy: 0,
             origin: location.origin,
           },
           events: {
             onReady: () => {
-              // onError мог прийти раньше — не затираем сообщение и ссылку
-              if (this.destroyed || this.state === 'error') return;
+              if (this.destroyed) return;
               this.ready = true;
-              this.setState('ready');
-              if (this.pendingPlay) this.doPlay();
+              if (this.owner) this.owner.onSlotReady();
+              else this.warm();
             },
-            onStateChange: e => this.onYTState(e.data),
-            onError: e => this.fail(e.data),
+            onStateChange: e => {
+              if (this.destroyed) return;
+              if (this.owner) this.owner.onYTState(e.data);
+              // заиграл в фоне — прогрелся (или вкладка снова видна и YouTube запустил отложенный старт)
+              else if (e.data === 1) this.settle();
+            },
+            onError: e => this.failed(e.data),
           },
         });
-      }).catch(() => this.fail('api'));
+      }).catch(() => this.failed('api'));
+    }
+    // беззвучно запускаем: YouTube подгружает начало фрагмента, как только заиграет — пауза
+    warm() {
+      try {
+        this.player.mute();
+        this.player.playVideo();
+      } catch { this.settle(); }
+    }
+    settle() {
+      clearTimeout(this.settleTimer);
+      if (this.destroyed || this.owner) return;
+      if (this.ready) {
+        try { this.player.pauseVideo(); } catch { /* ignore */ }
+      }
+      if (this.settled) return;
+      this.settled = true;
+      Preload.pump();
+    }
+    failed(code) {
+      if (this.destroyed) return;
+      this.error = code;
+      if (this.owner) return this.owner.fail(code);
+      this.settle();
+    }
+    // слот уходит клипу: на паузе, на начале фрагмента и со звуком; играть будет клип
+    adopt(owner, frame) {
+      this.settle();
+      // moveBefore переносит iframe, не перезагружая его; обычный appendChild загрузил бы плеер заново
+      frame.moveBefore(this.el, null);
+      this.owner = owner;
+      if (this.ready) {
+        try {
+          this.player.seekTo(this.media.start || 0, true);
+          this.player.unMute();
+        } catch { /* ignore */ }
+      }
+    }
+    destroy() {
+      this.destroyed = true;
+      clearTimeout(this.settleTimer);
+      try { if (this.player) this.player.destroy(); } catch { /* ignore */ }
+      this.el.remove();
+    }
+  }
+
+  class YTClip extends Clip {
+    init() {
+      // на сверке клип открывают кнопкой — заранее грузим только вопросы
+      this.slot = (this.mode !== 'reveal' && Preload.take(this.media, this, this.frame)) || null;
+      if (!this.slot) {
+        this.slot = new YTSlot(this.media, this.frame);
+        this.slot.owner = this;
+      }
+      if (this.slot.ready) this.onSlotReady();
+    }
+    get player() { return this.slot && this.slot.player; }
+    onSlotReady() {
+      // onError мог прийти раньше — не затираем сообщение и ссылку
+      if (this.destroyed || this.state === 'error') return;
+      this.ready = true;
+      this.setState('ready');
+      if (this.pendingPlay) this.doPlay();
     }
     onYTState(s) {
       if (this.destroyed || this.state === 'error') return;
@@ -387,7 +466,7 @@
       this.destroyed = true;
       this.stopLoop();
       clearTimeout(this.blockTimer);
-      try { if (this.player) this.player.destroy(); } catch { /* ignore */ }
+      this.slot.destroy();
     }
   }
 
@@ -443,6 +522,80 @@
     if (question.yt) return { kind: 'yt', id: question.yt.id, start: question.yt.start || 0, end: question.yt.end };
     return null;
   }
+  const mediaKey = m => `${m.kind}:${m.id || m.src}@${m.start}-${m.end}`;
+
+  // Пока идёт игра, следующие фрагменты грузятся в фоне, в невидимых плеерах: открылся вопрос —
+  // его плеер переезжает на экран уже готовым, без «Загружаю…». Греем по одному, чтобы не отнимать
+  // сеть у того, что играет сейчас. Перенести iframe без перезагрузки умеет только moveBefore
+  // (Chrome 133+); где его нет, фрагмент грузится как раньше — когда открылся вопрос.
+  const PRELOAD_AHEAD = 2;
+  const Preload = {
+    slots: [],
+    pool: null,
+    timer: null,
+    supported: 'moveBefore' in Element.prototype && location.protocol !== 'file:',
+    // ближайшие вопросы с YouTube после текущего шага — и через сверку, в следующий раунд
+    wanted() {
+      const out = [];
+      if (!game || !this.supported) return out;
+      for (let i = game.step + 1; i < steps.length && out.length < PRELOAD_AHEAD; i++) {
+        const st = steps[i];
+        if (st.kind !== 'question') continue;
+        const m = mediaOf(questionOf(st.r, st.q));
+        if (m && m.kind === 'yt') out.push(m);
+      }
+      return out;
+    },
+    // после смены шага — с задержкой: сначала пусть стартует фрагмент текущего вопроса
+    schedule() {
+      clearTimeout(this.timer);
+      if (!this.supported) return;
+      this.timer = setTimeout(() => this.sync(), 1200);
+    },
+    sync() {
+      // фрагмент текущего вопроса ещё грузится — сеть сначала ему
+      const cur = Media.ctrl;
+      if (cur && (cur.state === 'loading' || cur.pendingPlay)) return this.schedule();
+      const keys = this.wanted().map(mediaKey);
+      this.slots = this.slots.filter(s => {
+        if (keys.includes(s.key)) return true;
+        s.destroy();
+        return false;
+      });
+      this.pump();
+    },
+    pump() {
+      if (this.slots.some(s => !s.settled)) return;
+      const have = new Set(this.slots.map(s => s.key));
+      const m = this.wanted().find(x => !have.has(mediaKey(x)));
+      if (!m) return;
+      if (!this.pool) {
+        this.pool = document.createElement('div');
+        this.pool.className = 'yt-pool';
+        this.pool.setAttribute('aria-hidden', 'true');
+        this.pool.inert = true;
+        document.body.appendChild(this.pool);
+      }
+      this.slots.push(new YTSlot(m, this.pool));
+    },
+    take(media, owner, frame) {
+      const i = this.slots.findIndex(s => s.key === mediaKey(media) && s.error == null);
+      if (i < 0) return null;
+      const [slot] = this.slots.splice(i, 1);
+      try {
+        slot.adopt(owner, frame);
+        return slot;
+      } catch {
+        slot.destroy();
+        return null;
+      }
+    },
+    clear() {
+      clearTimeout(this.timer);
+      this.slots.forEach(s => s.destroy());
+      this.slots = [];
+    },
+  };
 
   // Клип ужимается под высоту окна, чтобы варианты, таймер и «Дальше» были видны без прокрутки.
   // Видео не меньше 480×270: в маленьком плеере YouTube показывает свои плашки, а они спойлерят.
@@ -594,6 +747,7 @@
       // ошибка в паке или в сохранении не должна оставлять пустой экран посреди вечера
       console.error(err);
       Media.destroy();
+      Preload.clear();
       Timer.stop();
       app.innerHTML = `
         <div class="modal">
@@ -613,7 +767,10 @@
     Media.destroy();
     Timer.stop();
     if (confettiEl) { confettiEl.remove(); confettiEl = null; }
-    if (!game) return renderSetup();
+    if (!game) {
+      Preload.clear();
+      return renderSetup();
+    }
 
     const st = steps[game.step];
     const views = { intro: viewIntro, bet: viewBet, question: viewQuestion, check: viewCheck, answer: viewAnswer, roundEnd: viewRoundEnd, final: viewFinal };
@@ -626,6 +783,7 @@
       </div>`;
     if (v.mount) v.mount();
     save();
+    Preload.schedule();
   }
 
   function viewTop(st) {
