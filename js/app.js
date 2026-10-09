@@ -188,7 +188,8 @@
       this.end = media.end || this.start + 15;
       this.state = 'loading';
       this.ready = false;
-      this.pendingPlay = false;
+      this.pendingPlay = false; // запуск попросили, звук ещё не пошёл
+      this.held = false; // запуск отменили паузой, пока грузилось
       this.destroyed = false;
       host.innerHTML = `
         <div class="clip clip--${mode}" data-state="loading">
@@ -220,30 +221,58 @@
     setState(s) {
       this.state = s;
       this.root.dataset.state = s;
+      if (s === 'playing') { this.pendingPlay = false; clearTimeout(this.blockTimer); }
       this.renderUI();
       if (s === 'playing' && this.onPlay) this.onPlay();
     }
     renderUI() {
-      const labels = {
-        loading: this.mode === 'audio' ? '▶ Слушать' : '▶ Смотреть',
-        ready: this.mode === 'audio' ? '▶ Слушать' : '▶ Смотреть',
-        playing: '❚❚ Пауза',
-        paused: '▶ Дальше',
-        ended: '↺ Ещё раз',
-        error: 'Недоступно',
-      };
-      this.playBtn.textContent = labels[this.state];
+      const go = this.mode === 'audio' ? '▶ Слушать' : '▶ Смотреть';
+      // запуск уже попросили (кнопкой или автозапуском), а звук ещё не пошёл
+      const waiting = this.pendingPlay && this.state !== 'playing' && this.state !== 'error';
+      const labels = { loading: go, ready: go, playing: '❚❚ Пауза', paused: '▶ Дальше', ended: '↺ Ещё раз', error: 'Недоступно' };
+      this.playBtn.textContent = waiting ? '❚❚ Пауза' : labels[this.state];
       this.playBtn.disabled = this.state === 'error';
       const msgs = {
-        loading: this.pendingPlay ? 'Загружаю…' : 'Готовлю фрагмент…',
+        loading: 'Готовлю фрагмент…',
         ready: this.mode === 'audio' ? 'Нажмите «Слушать» или пробел' : 'Нажмите «Смотреть» или пробел',
         playing: this.mode === 'audio' ? 'Слушаем' : '',
         paused: 'Пауза',
         ended: 'Фрагмент закончился',
       };
-      if (this.state !== 'error') this.msg.textContent = msgs[this.state];
+      if (this.state !== 'error') this.msg.textContent = waiting ? 'Загружаю…' : msgs[this.state];
     }
-    toggle() { this.state === 'playing' ? this.pause() : this.play(); }
+    // play/pause/replay общие; плееры дают только doPlay/doPause/doSeek
+    play() {
+      if (this.destroyed || this.state === 'error' || this.state === 'playing') return;
+      Sound.ensure();
+      if (this.state === 'ended') return this.replay();
+      this.held = false;
+      this.pendingPlay = true;
+      this.renderUI();
+      if (this.ready) this.doPlay();
+    }
+    pause() {
+      // held: паузу нажали, пока грузилось, — запоздалый старт плеера надо погасить
+      if (this.pendingPlay) { this.pendingPlay = false; this.held = true; clearTimeout(this.blockTimer); this.renderUI(); }
+      if (this.ready) this.doPause();
+    }
+    replay() {
+      if (this.destroyed || this.state === 'error') return;
+      if (this.state === 'playing') return this.doSeek();
+      Sound.ensure();
+      this.held = false;
+      this.pendingPlay = true;
+      this.renderUI();
+      // не загрузился — начнёт с начала фрагмента, когда будет готов
+      if (this.ready) { this.doSeek(); this.doPlay(); }
+    }
+    toggle() { this.state === 'playing' || this.pendingPlay ? this.pause() : this.play(); }
+    // браузер запретил автозапуск со звуком — возвращаем кнопку «Слушать», дальше по клику
+    blocked() {
+      if (!this.pendingPlay || this.state === 'playing') return;
+      this.pendingPlay = false;
+      this.renderUI();
+    }
     loop() {
       cancelAnimationFrame(this.raf);
       const step = () => {
@@ -300,7 +329,7 @@
               if (this.destroyed) return;
               this.ready = true;
               this.setState('ready');
-              if (this.pendingPlay) this.play();
+              if (this.pendingPlay) this.doPlay();
             },
             onStateChange: e => this.onYTState(e.data),
             onError: e => this.fail(e.data),
@@ -310,9 +339,15 @@
     }
     onYTState(s) {
       if (this.destroyed || this.state === 'error') return;
+      // буферизуется — значит, запуск не заблокирован, просто медленный интернет
+      if (s === 3) clearTimeout(this.blockTimer);
       if (s === 1 && this.state !== 'playing') {
+        // паузу нажали, пока грузилось, а YouTube всё равно стартовал
+        if (this.held) { this.player.pauseVideo(); return; }
         // титры не нужны: могут проспойлерить
         try { this.player.unloadModule('captions'); } catch { /* ignore */ }
+        // при запрете автозапуска со звуком YouTube может тихо заиграть без звука
+        try { if (this.player.isMuted()) this.player.unMute(); } catch { /* ignore */ }
         this.setState('playing');
         this.loop();
       } else if (s === 2 && this.state === 'playing') {
@@ -321,22 +356,19 @@
         this.finish();
       }
     }
-    play() {
-      Sound.ensure();
-      if (!this.ready) { this.pendingPlay = true; this.renderUI(); return; }
-      if (this.state === 'ended') return this.replay();
+    doPlay() {
       this.player.playVideo();
+      // заблокированный автозапуск YouTube не сообщает ошибкой — просто не стартует
+      clearTimeout(this.blockTimer);
+      this.blockTimer = setTimeout(() => this.blocked(), 5000);
     }
-    pause() { if (this.ready) this.player.pauseVideo(); }
-    replay() {
-      if (!this.ready) return this.play();
-      this.player.seekTo(this.start, true);
-      this.player.playVideo();
-    }
+    doPause() { this.player.pauseVideo(); }
+    doSeek() { this.player.seekTo(this.start, true); }
     time() { return (this.player && this.player.getCurrentTime && this.player.getCurrentTime()) || 0; }
     destroy() {
       this.destroyed = true;
       cancelAnimationFrame(this.raf);
+      clearTimeout(this.blockTimer);
       try { if (this.player) this.player.destroy(); } catch { /* ignore */ }
     }
   }
@@ -350,25 +382,21 @@
         this.el.currentTime = this.start;
         this.ready = true;
         this.setState('ready');
-        if (this.pendingPlay) this.play();
+        if (this.pendingPlay) this.doPlay();
       }, { once: true });
-      this.el.addEventListener('playing', () => { this.setState('playing'); this.loop(); });
+      this.el.addEventListener('playing', () => {
+        if (this.state === 'playing') return;
+        if (this.held) { this.el.pause(); return; }
+        this.setState('playing');
+        this.loop();
+      });
       this.el.addEventListener('pause', () => { if (this.state === 'playing') this.setState('paused'); });
       this.el.addEventListener('ended', () => { if (this.state === 'playing') this.finish(); });
       this.el.addEventListener('error', () => this.fail('file'));
     }
-    play() {
-      Sound.ensure();
-      if (!this.ready) { this.pendingPlay = true; this.renderUI(); return; }
-      if (this.state === 'ended') return this.replay();
-      this.el.play().catch(() => {});
-    }
-    pause() { this.el.pause(); }
-    replay() {
-      if (!this.ready) return this.play();
-      this.el.currentTime = this.start;
-      this.el.play().catch(() => {});
-    }
+    doPlay() { this.el.play().catch(() => this.blocked()); }
+    doPause() { this.el.pause(); }
+    doSeek() { this.el.currentTime = this.start; }
     time() { return this.el.currentTime; }
     destroy() {
       this.destroyed = true;
@@ -741,12 +769,14 @@
       mount: () => {
         if (useTimer) Timer.setup(time, next);
         if (media) {
-          Media.mount(app.querySelector('[data-media]'), media, {
+          const clip = Media.mount(app.querySelector('[data-media]'), media, {
             mode,
             // таймер идёт после фрагмента; при повторе клипа — на паузе
             onPlay: () => { if (Timer.running) Timer.pause(); },
             onEnded: () => { if (useTimer) Timer.start(); },
           });
+          // фрагмент стартует сам, как только открылся вопрос; на переходе render() его глушит
+          clip.play();
           fitClip();
           if (document.fonts) document.fonts.ready.then(fitClip);
         } else if (useTimer) {
@@ -1115,11 +1145,11 @@
     clearTimeout(Timer.doneHandle);
     Timer.doneHandle = null;
     Timer.pause();
+    // играющий или ещё грузящийся фрагмент ставим на паузу и продолжаем после «Продолжить игру»
     const clip = Media.ctrl;
-    if (clip) {
-      // фрагмент, который ещё грузится после «Слушать», не должен заиграть за меню
-      if (clip.pendingPlay) { clip.pendingPlay = false; clip.renderUI(); }
-      if (clip.state === 'playing') clip.pause();
+    if (clip && (clip.state === 'playing' || clip.pendingPlay)) {
+      menu.clip = clip;
+      clip.pause();
     }
     // всё под меню недоступно: Tab + Enter не нажмёт кнопки игры за затемнением
     app.inert = true;
@@ -1148,13 +1178,14 @@
 
   function closeMenu(resume) {
     if (!menu) return;
-    const { el, wasRunning, pendingNext } = menu;
+    const { el, wasRunning, pendingNext, clip } = menu;
     menu = null;
     el.remove();
     app.inert = false;
     if (!resume) return;
-    if (pendingNext) next();
-    else if (wasRunning) Timer.start();
+    if (pendingNext) return next();
+    if (wasRunning) Timer.start();
+    if (clip && Media.ctrl === clip) clip.play();
   }
 
   function refreshScores() {
@@ -1300,9 +1331,11 @@
 
   document.addEventListener('keydown', e => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
-    const typing = e.target.matches && e.target.matches('input, textarea');
+    // событие может прийти прямо на document — у него нет closest/matches
+    const target = e.target instanceof Element ? e.target : document.body;
+    const typing = target.matches('input, textarea');
     if (!game) {
-      if (e.key !== 'Enter' || e.target.closest('button')) return;
+      if (e.key !== 'Enter' || target.closest('button')) return;
       e.preventDefault();
       const memberInput = e.target.dataset && e.target.dataset.memberInput;
       if (memberInput != null) {
@@ -1327,7 +1360,7 @@
       return;
     }
     if (typing) return;
-    if ((e.key === 'Enter' || e.key === ' ') && e.target.closest('button')) return;
+    if ((e.key === 'Enter' || e.key === ' ') && target.closest('button')) return;
     // зажатая клавиша не должна пролистывать вопросы пачкой
     if (e.repeat) { if (['ArrowRight', 'ArrowLeft', 'Enter', 'NumpadEnter', 'PageDown', 'PageUp', 'Space'].includes(e.code)) e.preventDefault(); return; }
 
