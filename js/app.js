@@ -252,12 +252,19 @@
       if (this.ready) this.doPlay();
     }
     pause() {
-      // held: паузу нажали, пока грузилось, — запоздалый старт плеера надо погасить
-      if (this.pendingPlay) { this.pendingPlay = false; this.held = true; clearTimeout(this.blockTimer); this.renderUI(); }
-      if (this.ready) this.doPause();
+      // held: играть не просили — запоздалый старт плеера (событие уже было в пути) гасим
+      this.held = true;
+      if (this.pendingPlay) { this.pendingPlay = false; clearTimeout(this.blockTimer); this.renderUI(); }
+      if (!this.ready) return;
+      this.doPause();
+      // состояние меняем сразу, не дожидаясь события плеера: иначе цикл успевает «доиграть»
+      // фрагмент под меню и запустить таймер, а шторка в видео закрывается с опозданием
+      if (this.state === 'playing') { this.stopLoop(); this.setState('paused'); }
     }
     replay() {
       if (this.destroyed || this.state === 'error') return;
+      // YouTube ещё какое-то время отдаёт старую позицию (у самого конца) — не считаем это концом
+      this.seekUntil = performance.now() + 1500;
       if (this.state === 'playing') return this.doSeek();
       Sound.ensure();
       this.held = false;
@@ -274,15 +281,25 @@
       this.renderUI();
     }
     loop() {
-      cancelAnimationFrame(this.raf);
-      const step = () => {
-        if (this.destroyed || this.state !== 'playing') return;
+      this.stopLoop();
+      // false — играть больше не надо (конец фрагмента, пауза, уничтожен)
+      const check = () => {
+        if (this.destroyed || this.state !== 'playing') return false;
         const t = this.time();
         this.paint(t);
-        if (t >= this.end - 0.05) return this.finish();
-        this.raf = requestAnimationFrame(step);
+        if (t < this.end - 0.3) this.seekUntil = 0;
+        if (t >= this.end - 0.05 && !(performance.now() < this.seekUntil)) { this.finish(); return false; }
+        return true;
       };
+      const step = () => { if (check()) this.raf = requestAnimationFrame(step); };
       this.raf = requestAnimationFrame(step);
+      // rAF замирает, когда окно браузера закрыто другим (скажем, заметками с ответами),
+      // и фрагмент играл бы дальше конца — прямо в спойлер. Таймер работает и тогда.
+      this.watch = setInterval(() => { if (!check()) clearInterval(this.watch); }, 200);
+    }
+    stopLoop() {
+      cancelAnimationFrame(this.raf);
+      clearInterval(this.watch);
     }
     paint(t) {
       const span = this.end - this.start;
@@ -291,7 +308,7 @@
       this.timeEl.textContent = `${fmtTime(pos)} / ${fmtTime(span)}`;
     }
     finish() {
-      cancelAnimationFrame(this.raf);
+      this.stopLoop();
       this.pause();
       this.paint(this.end);
       this.setState('ended');
@@ -299,7 +316,7 @@
     }
     fail(code) {
       if (this.destroyed) return;
-      cancelAnimationFrame(this.raf);
+      this.stopLoop();
       this.setState('error');
       const link = this.media.kind === 'yt'
         ? `<a href="https://www.youtube.com/watch?v=${encodeURIComponent(this.media.id)}&t=${Math.floor(this.start)}s" target="_blank" rel="noopener">Открыть на YouTube ↗</a><small>(с ${fmtTime(this.start)} до ${fmtTime(this.end)}; название во вкладке спойлерит)</small>`
@@ -326,7 +343,8 @@
           },
           events: {
             onReady: () => {
-              if (this.destroyed) return;
+              // onError мог прийти раньше — не затираем сообщение и ссылку
+              if (this.destroyed || this.state === 'error') return;
               this.ready = true;
               this.setState('ready');
               if (this.pendingPlay) this.doPlay();
@@ -342,7 +360,7 @@
       // буферизуется — значит, запуск не заблокирован, просто медленный интернет
       if (s === 3) clearTimeout(this.blockTimer);
       if (s === 1 && this.state !== 'playing') {
-        // паузу нажали, пока грузилось, а YouTube всё равно стартовал
+        // играть не просили (пауза, меню), а YouTube всё равно стартовал
         if (this.held) { this.player.pauseVideo(); return; }
         // титры не нужны: могут проспойлерить
         try { this.player.unloadModule('captions'); } catch { /* ignore */ }
@@ -367,7 +385,7 @@
     time() { return (this.player && this.player.getCurrentTime && this.player.getCurrentTime()) || 0; }
     destroy() {
       this.destroyed = true;
-      cancelAnimationFrame(this.raf);
+      this.stopLoop();
       clearTimeout(this.blockTimer);
       try { if (this.player) this.player.destroy(); } catch { /* ignore */ }
     }
@@ -400,7 +418,7 @@
     time() { return this.el.currentTime; }
     destroy() {
       this.destroyed = true;
-      cancelAnimationFrame(this.raf);
+      this.stopLoop();
       this.el.pause();
       this.el.removeAttribute('src');
       this.el.load();
@@ -692,7 +710,7 @@
       html: `
         <div class="intro">
           <div class="kicker">Раунд ${r + 1} из ${pack.rounds.length}</div>
-          ${round.icon ? `<div class="intro-icon">${round.icon}</div>` : ''}
+          ${round.icon ? `<div class="intro-icon">${esc(round.icon)}</div>` : ''}
           <h1 class="intro-title">${esc(round.title)}</h1>
           ${round.description ? `<p class="intro-desc">${fmtText(round.description)}</p>` : ''}
           <div class="pills">${rules.map(x => `<span class="pill">${x}</span>`).join('')}</div>
@@ -712,7 +730,8 @@
     game.teams.forEach((_, p) => {
       if (game.bets[k][p] != null) return;
       const left = availableBets(r, p, q);
-      if (left.length === 1) game.bets[k][p] = left[0];
+      // ставок в паке меньше, чем вопросов: без значения кнопка «К вопросу» навсегда серая
+      if (left.length <= 1) game.bets[k][p] = left.length ? left[0] : 0;
     });
     const values = [...new Set(betValues(round))];
     const rows = game.teams.map((pl, p) => {
@@ -773,7 +792,8 @@
             mode,
             // таймер идёт после фрагмента; при повторе клипа — на паузе
             onPlay: () => { if (Timer.running) Timer.pause(); },
-            onEnded: () => { if (useTimer) Timer.start(); },
+            // конец фрагмента под меню паузы — таймер пойдёт, когда меню закроют
+            onEnded: () => { if (!useTimer) return; if (menu) menu.wasRunning = true; else Timer.start(); },
           });
           // фрагмент стартует сам, как только открылся вопрос; на переходе render() его глушит
           clip.play();
@@ -892,23 +912,23 @@
     const max = maxScore();
     let title, sub = '';
     if (game.teams.length === 1) {
-      title = `${fmtPts(best)} из ${max}`;
-      const ratio = best / max;
+      title = `${fmtPts(best)} из ${fmtPts(max)}`;
+      const ratio = max > 0 ? best / max : 0;
       sub = `${esc(rows[0].name)}: ` + (ratio >= 0.8 ? 'гениально. Можно идти на настоящий квиз.'
         : ratio >= 0.6 ? 'очень достойно!'
           : ratio >= 0.4 ? 'неплохо, есть куда расти.'
             : 'главное — весело провели вечер.');
     } else if (winners.length > 1) {
       title = 'Ничья!';
-      sub = `${joinAnd(winners.map(x => esc(x.name)))} — по ${fmtPts(best)} из ${max}. Требуется реванш.`;
+      sub = `${joinAnd(winners.map(x => esc(x.name)))} — по ${fmtPts(best)} из ${fmtPts(max)}. Требуется реванш.`;
     } else {
       const w = winners[0];
       title = w.members.length > 1 ? `Побеждает команда «${esc(w.name)}»!` : `Побеждает ${esc(w.name)}!`;
-      sub = `${w.who ? `${esc(w.who)} — ` : ''}${fmtPts(best)} ${plural(best, 'балл', 'балла', 'баллов')} из ${max}.`;
+      sub = `${w.who ? `${esc(w.who)} — ` : ''}${fmtPts(best)} ${plural(best, 'балл', 'балла', 'баллов')} из ${fmtPts(max)}.`;
     }
     const head = game.teams.map((pl, p) => `<th style="--c:${COLORS[p]}">${esc(pl.name)}</th>`).join('');
     const body = pack.rounds.map((round, r) => `
-      <tr><td>${round.icon || ''} ${esc(round.title)}</td>${game.teams.map((_, p) => `<td>${fmtPts(roundScore(r, p))}</td>`).join('')}</tr>`).join('');
+      <tr><td>${esc(round.icon)} ${esc(round.title)}</td>${game.teams.map((_, p) => `<td>${fmtPts(roundScore(r, p))}</td>`).join('')}</tr>`).join('');
     const foot = `<tr><td>Итого</td>${game.teams.map((_, p) => `<td>${fmtPts(totalScore(p))}</td>`).join('')}</tr>`;
     return {
       html: `
@@ -1069,8 +1089,12 @@
     app.querySelector('.teams').classList.add('is-shuffled');
   }
 
+  const hasSave = () => !!savedPack(migrateSave(store.get(SAVE_KEY)));
+
   function startGame() {
     syncSetupInputs();
+    // новая игра затирает сохранение — вечер не должен пропасть от случайного клика
+    if (hasSave() && !confirm('Начать новую игру? Незаконченная будет потеряна.')) return;
     pack = PACKS.find(p => p.id === prefs.packId) || PACKS[0];
     if (!pack) return;
     steps = buildSteps(pack);
@@ -1104,6 +1128,14 @@
   const NAV_COOLDOWN = 350;
   let stepChangedAt = 0;
 
+  // в главное меню; кулдаун и тут — второй Enter не должен сразу стартовать новую игру
+  function toSetup() {
+    game = null;
+    stepChangedAt = performance.now();
+    render();
+    window.scrollTo(0, 0);
+  }
+
   function goTo(step) {
     game.step = step;
     stepChangedAt = performance.now();
@@ -1117,9 +1149,7 @@
     if (st.kind === 'bet' && !allBetsSet(key(st.r, st.q))) return;
     if (st.kind === 'final') {
       store.del(SAVE_KEY);
-      game = null;
-      render();
-      return;
+      return toSetup();
     }
     goTo(Math.min(steps.length - 1, game.step + 1));
   }
@@ -1147,8 +1177,9 @@
     Timer.pause();
     // играющий или ещё грузящийся фрагмент ставим на паузу и продолжаем после «Продолжить игру»
     const clip = Media.ctrl;
-    if (clip && (clip.state === 'playing' || clip.pendingPlay)) {
-      menu.clip = clip;
+    if (clip) {
+      if (clip.state === 'playing' || clip.pendingPlay) menu.clip = clip;
+      // и не начавшийся клип тоже: иначе запоздалый старт YouTube заиграл бы под меню
       clip.pause();
     }
     // всё под меню недоступно: Tab + Enter не нажмёт кнопки игры за затемнением
@@ -1168,8 +1199,7 @@
       else if (b && b.dataset.menu === 'exit') {
         closeMenu(false);
         save();
-        game = null;
-        render();
+        toSetup();
       }
     });
     document.body.appendChild(menu.el);
@@ -1297,10 +1327,7 @@
       render();
     },
     // аварийный экран: сохранение не трогаем — вдруг ошибку поправят и игру можно будет продолжить
-    'crash-menu': () => {
-      game = null;
-      render();
-    },
+    'crash-menu': toSetup,
     'crash-reset': () => {
       store.del(SAVE_KEY);
       store.del(PREFS_KEY);
@@ -1351,12 +1378,15 @@
         if (input) input.focus();
         return;
       }
-      if (e.repeat) return;
-      startGame();
+      if (e.repeat || performance.now() - stepChangedAt < NAV_COOLDOWN) return;
+      // есть незаконченная игра — Enter её продолжает, а не затирает новой
+      if (hasSave()) resumeGame();
+      else startGame();
       return;
     }
     if (menu) {
-      if (e.code === 'Escape') { e.preventDefault(); closeMenu(true); }
+      // зажатый Esc: повтор клавиши не должен тут же закрыть только что открытое меню
+      if (e.code === 'Escape' && !e.repeat) { e.preventDefault(); closeMenu(true); }
       return;
     }
     if (typing) return;

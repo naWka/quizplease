@@ -10,7 +10,10 @@
   main { max-width: 720px; margin: 0 auto; }
   h1 { font-size: 24px; margin: 0 0 4px; }
   p { color: #a8a1cb; margin: 0 0 16px; }
-  #player { position: fixed; right: 16px; bottom: 16px; width: 160px; height: 90px; opacity: 0.25; pointer-events: none; }
+  /* плеер должен быть на экране (иначе браузер не запустит видео), но кадры и название
+     закрыты непрозрачной плашкой — проверка не должна спойлерить клипы */
+  #player { position: fixed; right: 16px; bottom: 16px; width: 160px; height: 90px; pointer-events: none; }
+  #player::after { content: ''; position: absolute; inset: 0; background: #0e0c18; z-index: 1; }
   ol { padding-left: 1.4em; }
   li { padding: 2px 0; font-variant-numeric: tabular-nums; }
   .ok { color: #2ee6b6; } .bad { color: #ff5d73; font-weight: 700; } .wait { color: #a8a1cb; }
@@ -52,14 +55,29 @@
   function buildList() {
     (window.QUIZ_PACKS || []).forEach(p => p.rounds.forEach((r, ri) => r.questions.forEach((q, qi) => {
       const label = `«${p.title}» — раунд ${ri + 1}, вопрос ${qi + 1}`;
-      if (q.yt) clips.push({ label, kind: 'yt', ...q.yt });
-      else if (q.file) clips.push({ label, kind: 'file', ...q.file });
+      // без end движок играет 15 секунд от start — проверяем то же самое
+      const m = q.yt || q.file;
+      if (m) clips.push({ label, kind: q.yt ? 'yt' : 'file', ...m, start: m.start || 0, end: m.end || (m.start || 0) + 15 });
     })));
-    rows = clips.map(c => { const li = document.createElement('li'); li.innerHTML = `${c.label}: <span class="wait">ждёт</span>`; list.appendChild(li); return li.lastChild; });
+    rows = clips.map(c => {
+      const li = document.createElement('li');
+      const status = document.createElement('span');
+      status.className = 'wait';
+      status.textContent = 'ждёт';
+      li.append(`${c.label}: `, status);
+      list.appendChild(li);
+      return status;
+    });
+  }
+
+  // таймкоды проверяем до загрузки видео
+  function badWindow(c) {
+    return c.end > c.start ? '' : `конец фрагмента (${c.end} с) не позже начала (${c.start} с)`;
   }
 
   function checkYT(c) {
     return new Promise(res => {
+      if (badWindow(c)) return res({ ok: false, text: badWindow(c) });
       document.getElementById('player').innerHTML = '<div id="pp"></div>';
       let done = false, player;
       const finish = (ok, text) => { if (done) return; done = true; try { player.destroy(); } catch (e) {} res({ ok, text }); };
@@ -72,7 +90,8 @@
             if (e.data !== 1) return;
             setTimeout(() => {
               const dur = player.getDuration ? player.getDuration() : 0;
-              if (dur && c.end > dur + 0.5) finish(false, `фрагмент кончается на ${c.end} с, а видео длится ${Math.floor(dur)} с`);
+              if (dur && c.start >= dur) finish(false, `начало фрагмента (${c.start} с) за концом видео (${Math.floor(dur)} с)`);
+              else if (dur && c.end > dur + 0.5) finish(false, `фрагмент кончается на ${c.end} с, а видео длится ${Math.floor(dur)} с`);
               else finish(true, 'играет');
             }, 800);
           },
@@ -85,6 +104,7 @@
 
   function checkFile(c) {
     return new Promise(res => {
+      if (badWindow(c)) return res({ ok: false, text: badWindow(c) });
       const m = document.createElement('video');
       const finish = (ok, text) => { m.removeAttribute('src'); m.load(); res({ ok, text }); };
       m.preload = 'metadata';

@@ -892,4 +892,6 @@ code {
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+  /* задержка шторки — не анимация, а защита: прячет название ролика в первые доли секунды */
+  .clip--video[data-state="playing"] .clip-curtain { transition: opacity 0s linear 0.45s !important; }
 }
